@@ -3,19 +3,25 @@ package logrus_yc_hoook
 import (
 	"context"
 	"fmt"
-	fifo "github.com/foize/go.fifo"
 	"github.com/sirupsen/logrus"
 	"github.com/yandex-cloud/go-genproto/yandex/cloud/logging/v1"
 	ycsdk "github.com/yandex-cloud/go-sdk"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"math"
+	"os"
 	"time"
 )
 
+const bufferSize = 100
+
 type Hook struct {
-	sdk        *ycsdk.SDK
-	q          *fifo.Queue
-	logGroupId string
+	sdk         *ycsdk.SDK
+	logGroupId  string
+	entriesCh   chan *logrus.Entry
+	entriesBuff []*logging.IncomingLogEntry
+	ctx         context.Context
+	ctxCancel   context.CancelFunc
 }
 
 var logLevelMap = map[logrus.Level]logging.LogLevel_Level{
@@ -37,13 +43,24 @@ func New(credentials ycsdk.Credentials, logGroupId string) (*Hook, error) {
 		return nil, err
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	hook := &Hook{
-		sdk:        sdk,
-		q:          fifo.NewQueue(),
-		logGroupId: logGroupId,
+		sdk:         sdk,
+		logGroupId:  logGroupId,
+		entriesCh:   make(chan *logrus.Entry, bufferSize),
+		entriesBuff: make([]*logging.IncomingLogEntry, 0, bufferSize),
+		ctx:         ctx,
+		ctxCancel:   cancel,
 	}
 
 	go hook.start()
+
+	go func() {
+		<-ctx.Done()
+
+		close(hook.entriesCh)
+	}()
 
 	return hook, nil
 }
@@ -61,45 +78,60 @@ func (h *Hook) Levels() []logrus.Level {
 }
 
 func (h *Hook) Fire(entry *logrus.Entry) error {
-	h.q.Add(entry)
+	select {
+	case <-h.ctx.Done():
+		return fmt.Errorf("failed to write log entry: context canceled")
+	default:
+		h.entriesCh <- entry
+	}
 
 	return nil
 }
 
+func (h *Hook) flushLogs() {
+	if len(h.entriesBuff) > 0 {
+		idx := int(math.Min(float64(bufferSize), float64(len(h.entriesBuff))))
+		entriesToSend := h.entriesBuff[:idx]
+
+		_, err := h.sdk.LogIngestion().LogIngestion().Write(context.Background(), &logging.WriteRequest{
+			Entries: entriesToSend,
+			Destination: &logging.Destination{
+				Destination: &logging.Destination_LogGroupId{
+					LogGroupId: h.logGroupId,
+				},
+			},
+		})
+
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Error sending logs to YC: %s", err.Error())
+		} else {
+			h.entriesBuff = h.entriesBuff[idx:]
+		}
+	}
+}
+
 func (h *Hook) start() {
 	for {
-		entries := make([]*logging.IncomingLogEntry, 0)
-
-		for h.q.Len() > 0 {
-			qItem := h.q.Next().(*logrus.Entry)
-
-			jsonStruct, _ := structpb.NewStruct(qItem.Data)
+		select {
+		case <-h.ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+			h.flushLogs()
+		case rawEntry := <-h.entriesCh:
+			jsonStruct, _ := structpb.NewStruct(rawEntry.Data)
 
 			entry := &logging.IncomingLogEntry{
-				Level:       logLevelMap[qItem.Level],
-				Message:     qItem.Message,
-				Timestamp:   timestamppb.New(qItem.Time),
+				Level:       logLevelMap[rawEntry.Level],
+				Message:     rawEntry.Message,
+				Timestamp:   timestamppb.New(rawEntry.Time),
 				JsonPayload: jsonStruct,
 			}
 
-			entries = append(entries, entry)
-		}
+			h.entriesBuff = append(h.entriesBuff, entry)
 
-		if len(entries) > 0 {
-			_, err := h.sdk.LogIngestion().LogIngestion().Write(context.Background(), &logging.WriteRequest{
-				Entries: entries,
-				Destination: &logging.Destination{
-					Destination: &logging.Destination_LogGroupId{
-						LogGroupId: h.logGroupId,
-					},
-				},
-			})
-
-			if err != nil {
-				fmt.Printf("Error writing logs: %s", err.Error())
+			if len(h.entriesBuff) >= bufferSize {
+				h.flushLogs()
 			}
 		}
-
-		time.Sleep(2 * time.Second)
 	}
 }
