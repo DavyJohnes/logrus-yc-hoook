@@ -13,11 +13,9 @@ import (
 	"time"
 )
 
-const bufferSize = 100
-
 type Hook struct {
 	sdk         *ycsdk.SDK
-	logGroupId  string
+	config      Config
 	entriesCh   chan *logrus.Entry
 	entriesBuff []*logging.IncomingLogEntry
 	ctx         context.Context
@@ -34,22 +32,39 @@ var logLevelMap = map[logrus.Level]logging.LogLevel_Level{
 	logrus.TraceLevel: logging.LogLevel_TRACE,
 }
 
-func New(credentials ycsdk.Credentials, logGroupId string) (*Hook, error) {
-	sdk, err := ycsdk.Build(context.Background(), ycsdk.Config{
-		Credentials: credentials,
+type Config struct {
+	Credentials ycsdk.Credentials
+	LogGroupId  string
+	BufferSize  int
+	SendTimeout time.Duration
+}
+
+func New(config Config) (*Hook, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	if config.BufferSize == 0 {
+		config.BufferSize = 100
+	}
+
+	if config.SendTimeout == 0 {
+		config.SendTimeout = 30 * time.Second
+	}
+
+	sdk, err := ycsdk.Build(ctx, ycsdk.Config{
+		Credentials: config.Credentials,
 	})
 
 	if err != nil {
+		cancel()
+
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
 	hook := &Hook{
 		sdk:         sdk,
-		logGroupId:  logGroupId,
-		entriesCh:   make(chan *logrus.Entry, bufferSize),
-		entriesBuff: make([]*logging.IncomingLogEntry, 0, bufferSize),
+		config:      config,
+		entriesCh:   make(chan *logrus.Entry, config.BufferSize),
+		entriesBuff: make([]*logging.IncomingLogEntry, 0, config.BufferSize),
 		ctx:         ctx,
 		ctxCancel:   cancel,
 	}
@@ -90,14 +105,17 @@ func (h *Hook) Fire(entry *logrus.Entry) error {
 
 func (h *Hook) flushLogs() {
 	if len(h.entriesBuff) > 0 {
-		idx := int(math.Min(float64(bufferSize), float64(len(h.entriesBuff))))
+		idx := int(math.Min(float64(h.config.BufferSize), float64(len(h.entriesBuff))))
 		entriesToSend := h.entriesBuff[:idx]
 
-		_, err := h.sdk.LogIngestion().LogIngestion().Write(context.Background(), &logging.WriteRequest{
+		ctx, cancel := context.WithTimeout(h.ctx, h.config.SendTimeout)
+		defer cancel()
+
+		_, err := h.sdk.LogIngestion().LogIngestion().Write(ctx, &logging.WriteRequest{
 			Entries: entriesToSend,
 			Destination: &logging.Destination{
 				Destination: &logging.Destination_LogGroupId{
-					LogGroupId: h.logGroupId,
+					LogGroupId: h.config.LogGroupId,
 				},
 			},
 		})
@@ -129,7 +147,7 @@ func (h *Hook) start() {
 
 			h.entriesBuff = append(h.entriesBuff, entry)
 
-			if len(h.entriesBuff) >= bufferSize {
+			if len(h.entriesBuff) >= h.config.BufferSize {
 				h.flushLogs()
 			}
 		}
