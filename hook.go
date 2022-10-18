@@ -96,35 +96,37 @@ func (h *Hook) Fire(entry *logrus.Entry) error {
 	select {
 	case <-h.ctx.Done():
 		return fmt.Errorf("failed to write log entry: yc hook closed")
-	default:
-		h.entriesCh <- entry
+	case h.entriesCh <- entry:
+		// do nothing
 	}
 
 	return nil
 }
 
 func (h *Hook) flushLogs() {
-	if len(h.entriesBuff) > 0 {
-		idx := int(math.Min(float64(h.config.BufferSize), float64(len(h.entriesBuff))))
-		entriesToSend := h.entriesBuff[:idx]
+	if len(h.entriesBuff) == 0 {
+		return
+	}
 
-		ctx, cancel := context.WithTimeout(h.ctx, h.config.SendTimeout)
-		defer cancel()
+	idx := int(math.Min(float64(h.config.BufferSize), float64(len(h.entriesBuff))))
+	entriesToSend := h.entriesBuff[:idx]
 
-		_, err := h.sdk.LogIngestion().LogIngestion().Write(ctx, &logging.WriteRequest{
-			Entries: entriesToSend,
-			Destination: &logging.Destination{
-				Destination: &logging.Destination_LogGroupId{
-					LogGroupId: h.config.LogGroupId,
-				},
+	ctx, cancel := context.WithTimeout(h.ctx, h.config.SendTimeout)
+	defer cancel()
+
+	_, err := h.sdk.LogIngestion().LogIngestion().Write(ctx, &logging.WriteRequest{
+		Entries: entriesToSend,
+		Destination: &logging.Destination{
+			Destination: &logging.Destination_LogGroupId{
+				LogGroupId: h.config.LogGroupId,
 			},
-		})
+		},
+	})
 
-		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "Error sending logs to YC: %s", err.Error())
-		} else {
-			h.entriesBuff = h.entriesBuff[idx:]
-		}
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Error sending logs to YC: %s", err.Error())
+	} else {
+		h.entriesBuff = h.entriesBuff[idx:]
 	}
 }
 
