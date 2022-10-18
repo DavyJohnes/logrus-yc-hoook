@@ -95,7 +95,7 @@ func (h *Hook) Levels() []logrus.Level {
 func (h *Hook) Fire(entry *logrus.Entry) error {
 	select {
 	case <-h.ctx.Done():
-		return fmt.Errorf("failed to write log entry: context canceled")
+		return fmt.Errorf("failed to write log entry: yc hook closed")
 	default:
 		h.entriesCh <- entry
 	}
