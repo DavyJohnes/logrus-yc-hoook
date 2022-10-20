@@ -122,6 +122,9 @@ func (h *Hook) Fire(entry *logrus.Entry) error {
 }
 
 func (h *Hook) Close() {
+	go h.flushLogs()
+
+	// wait unit all flushLogs will be finished
 	h.wg.Wait()
 
 	h.ctxCancel()
