@@ -3,23 +3,26 @@ package logrus_yc_hoook
 import (
 	"context"
 	"fmt"
+	grpc_retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
 	"github.com/sirupsen/logrus"
 	"github.com/yandex-cloud/go-genproto/yandex/cloud/logging/v1"
 	ycsdk "github.com/yandex-cloud/go-sdk"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
-	"math"
 	"os"
+	"sync"
 	"time"
 )
 
 type Hook struct {
-	sdk         *ycsdk.SDK
-	config      Config
-	entriesCh   chan *logrus.Entry
-	entriesBuff []*logging.IncomingLogEntry
-	ctx         context.Context
-	ctxCancel   context.CancelFunc
+	sdk              *ycsdk.SDK
+	config           Config
+	entriesCh        chan *logrus.Entry
+	entriesBuff      []*logging.IncomingLogEntry
+	entriesBuffMutex sync.Mutex
+	wg               sync.WaitGroup
+	ctx              context.Context
+	ctxCancel        context.CancelFunc
 }
 
 var logLevelMap = map[logrus.Level]logging.LogLevel_Level{
@@ -33,14 +36,23 @@ var logLevelMap = map[logrus.Level]logging.LogLevel_Level{
 }
 
 type Config struct {
-	Credentials ycsdk.Credentials
-	LogGroupId  string
-	BufferSize  int
-	SendTimeout time.Duration
+	Credentials        ycsdk.Credentials
+	LogGroupId         string
+	BufferSize         int
+	SendTimeout        time.Duration
+	SendRetriesCount   uint
+	SendRetriesTimeout time.Duration
 }
 
 func New(config Config) (*Hook, error) {
+	var err error
 	ctx, cancel := context.WithCancel(context.Background())
+
+	defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
 
 	if config.BufferSize == 0 {
 		config.BufferSize = 100
@@ -50,13 +62,19 @@ func New(config Config) (*Hook, error) {
 		config.SendTimeout = 30 * time.Second
 	}
 
+	if config.SendRetriesCount == 0 {
+		config.SendRetriesCount = 2
+	}
+
+	if config.SendRetriesTimeout == 0 {
+		config.SendRetriesTimeout = 2 * time.Second
+	}
+
 	sdk, err := ycsdk.Build(ctx, ycsdk.Config{
 		Credentials: config.Credentials,
 	})
 
 	if err != nil {
-		cancel()
-
 		return nil, err
 	}
 
@@ -103,13 +121,31 @@ func (h *Hook) Fire(entry *logrus.Entry) error {
 	return nil
 }
 
+func (h *Hook) Close() {
+	h.wg.Wait()
+
+	h.ctxCancel()
+}
+
 func (h *Hook) flushLogs() {
+	h.wg.Add(1)
+	defer h.wg.Done()
+
+	h.entriesBuffMutex.Lock()
+	defer h.entriesBuffMutex.Unlock()
+
 	if len(h.entriesBuff) == 0 {
 		return
 	}
 
-	idx := int(math.Min(float64(h.config.BufferSize), float64(len(h.entriesBuff))))
-	entriesToSend := h.entriesBuff[:idx]
+	entriesToSend := h.entriesBuff
+
+	if len(h.entriesBuff) > h.config.BufferSize {
+		entriesToSend = h.entriesBuff[:h.config.BufferSize]
+	}
+
+	h.entriesBuff = h.entriesBuff[len(entriesToSend):]
+	h.entriesBuffMutex.Unlock()
 
 	ctx, cancel := context.WithTimeout(h.ctx, h.config.SendTimeout)
 	defer cancel()
@@ -121,12 +157,10 @@ func (h *Hook) flushLogs() {
 				LogGroupId: h.config.LogGroupId,
 			},
 		},
-	})
+	}, grpc_retry.WithMax(h.config.SendRetriesCount), grpc_retry.WithPerRetryTimeout(h.config.SendRetriesTimeout))
 
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Error sending logs to YC: %s", err.Error())
-	} else {
-		h.entriesBuff = h.entriesBuff[idx:]
 	}
 }
 
@@ -136,7 +170,7 @@ func (h *Hook) start() {
 		case <-h.ctx.Done():
 			return
 		case <-time.After(2 * time.Second):
-			h.flushLogs()
+			go h.flushLogs()
 		case rawEntry := <-h.entriesCh:
 			jsonStruct, _ := structpb.NewStruct(rawEntry.Data)
 
@@ -150,7 +184,7 @@ func (h *Hook) start() {
 			h.entriesBuff = append(h.entriesBuff, entry)
 
 			if len(h.entriesBuff) >= h.config.BufferSize {
-				h.flushLogs()
+				go h.flushLogs()
 			}
 		}
 	}
