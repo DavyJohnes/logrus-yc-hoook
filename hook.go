@@ -138,7 +138,7 @@ func (h *Hook) flushLogs() {
 		return
 	}
 
-	entriesToSend := h.entriesBuff
+	entriesToSend := h.entriesBuff[:]
 
 	if len(h.entriesBuff) > h.config.BufferSize {
 		entriesToSend = h.entriesBuff[:h.config.BufferSize]
@@ -181,7 +181,9 @@ func (h *Hook) start() {
 				JsonPayload: jsonStruct,
 			}
 
+			h.entriesBuffMutex.Lock()
 			h.entriesBuff = append(h.entriesBuff, entry)
+			h.entriesBuffMutex.Unlock()
 
 			if len(h.entriesBuff) >= h.config.BufferSize {
 				go h.flushLogs()
