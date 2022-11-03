@@ -135,9 +135,10 @@ func (h *Hook) flushLogs() {
 	defer h.wg.Done()
 
 	h.entriesBuffMutex.Lock()
-	defer h.entriesBuffMutex.Unlock()
 
 	if len(h.entriesBuff) == 0 {
+		h.entriesBuffMutex.Unlock()
+
 		return
 	}
 
