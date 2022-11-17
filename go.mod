@@ -3,7 +3,7 @@ module github.com/DavyJohnes/logrus-yc-hoook
 go 1.19
 
 require (
-	github.com/foize/go.fifo v0.0.0-20130327144150-3a04cfeec121
+	github.com/grpc-ecosystem/go-grpc-middleware v1.3.0
 	github.com/sirupsen/logrus v1.9.0
 	github.com/yandex-cloud/go-genproto v0.0.0-20221010111330-0b826c42c781
 	github.com/yandex-cloud/go-sdk v0.0.0-20221010112024-bf39039cc451
