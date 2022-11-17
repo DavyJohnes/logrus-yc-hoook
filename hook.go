@@ -122,7 +122,7 @@ func (h *Hook) Fire(entry *logrus.Entry) error {
 }
 
 func (h *Hook) Close() {
-	go h.flushLogs()
+	h.flushLogs()
 
 	// wait unit all flushLogs will be finished
 	h.wg.Wait()
@@ -132,40 +132,43 @@ func (h *Hook) Close() {
 
 func (h *Hook) flushLogs() {
 	h.wg.Add(1)
-	defer h.wg.Done()
 
-	h.entriesBuffMutex.Lock()
+	go func() {
+		defer h.wg.Done()
 
-	if len(h.entriesBuff) == 0 {
+		h.entriesBuffMutex.Lock()
+
+		if len(h.entriesBuff) == 0 {
+			h.entriesBuffMutex.Unlock()
+
+			return
+		}
+
+		entriesToSend := h.entriesBuff[:]
+
+		if len(entriesToSend) > h.config.BufferSize {
+			entriesToSend = h.entriesBuff[:h.config.BufferSize]
+		}
+
+		h.entriesBuff = h.entriesBuff[len(entriesToSend):]
 		h.entriesBuffMutex.Unlock()
 
-		return
-	}
+		ctx, cancel := context.WithTimeout(h.ctx, h.config.SendTimeout)
+		defer cancel()
 
-	entriesToSend := h.entriesBuff[:]
-
-	if len(h.entriesBuff) > h.config.BufferSize {
-		entriesToSend = h.entriesBuff[:h.config.BufferSize]
-	}
-
-	h.entriesBuff = h.entriesBuff[len(entriesToSend):]
-	h.entriesBuffMutex.Unlock()
-
-	ctx, cancel := context.WithTimeout(h.ctx, h.config.SendTimeout)
-	defer cancel()
-
-	_, err := h.sdk.LogIngestion().LogIngestion().Write(ctx, &logging.WriteRequest{
-		Entries: entriesToSend,
-		Destination: &logging.Destination{
-			Destination: &logging.Destination_LogGroupId{
-				LogGroupId: h.config.LogGroupId,
+		_, err := h.sdk.LogIngestion().LogIngestion().Write(ctx, &logging.WriteRequest{
+			Entries: entriesToSend,
+			Destination: &logging.Destination{
+				Destination: &logging.Destination_LogGroupId{
+					LogGroupId: h.config.LogGroupId,
+				},
 			},
-		},
-	}, grpc_retry.WithMax(h.config.SendRetriesCount), grpc_retry.WithPerRetryTimeout(h.config.SendRetriesTimeout))
+		}, grpc_retry.WithMax(h.config.SendRetriesCount), grpc_retry.WithPerRetryTimeout(h.config.SendRetriesTimeout))
 
-	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Error sending logs to YC: %s", err.Error())
-	}
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Error sending logs to YC: %s", err.Error())
+		}
+	}()
 }
 
 func (h *Hook) start() {
@@ -174,7 +177,7 @@ func (h *Hook) start() {
 		case <-h.ctx.Done():
 			return
 		case <-time.After(2 * time.Second):
-			go h.flushLogs()
+			h.flushLogs()
 		case rawEntry := <-h.entriesCh:
 			jsonStruct, _ := structpb.NewStruct(rawEntry.Data)
 
@@ -190,7 +193,7 @@ func (h *Hook) start() {
 			h.entriesBuffMutex.Unlock()
 
 			if len(h.entriesBuff) >= h.config.BufferSize {
-				go h.flushLogs()
+				h.flushLogs()
 			}
 		}
 	}
